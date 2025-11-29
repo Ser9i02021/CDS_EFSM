@@ -7,6 +7,7 @@
 #include <QLineEdit>
 #include <QPen>
 #include <QBrush>
+#include "TransitionItem.h"
 
 namespace { constexpr qreal R = 50.0; }
 
@@ -19,12 +20,18 @@ StateItem::StateItem(const QString& name, QGraphicsItem* parent)
              QGraphicsItem::ItemSendsGeometryChanges);
 
     setPen(QPen(Qt::black, 1.5));
-    setBrush(QBrush(QColor(240, 240, 255)));
+    // setBrush(QBrush(QColor(240, 240, 255)));
+    setBrush(baseBrush_); // <- usa cor base
 
     label_ = new QGraphicsTextItem(name_, this);
     label_->setDefaultTextColor(Qt::black);
     label_->setFlag(QGraphicsItem::ItemIgnoresTransformations);
     updateLabelPos();
+}
+
+void StateItem::setActive(bool v){
+    active_ = v;
+    update();
 }
 
 void StateItem::setName(const QString& s){
@@ -55,6 +62,12 @@ void StateItem::updateLabelPos(){
 QVariant StateItem::itemChange(GraphicsItemChange change, const QVariant& value){
     if (change == QGraphicsItem::ItemPositionHasChanged) {
         updateLabelPos();
+        if (scene()){
+            const auto all = scene()->items();
+            for (QGraphicsItem* gi : all)
+                if (auto t = dynamic_cast<TransitionItem*>(gi))
+                    t->updatePath();
+        }
     }
     return QGraphicsEllipseItem::itemChange(change, value);
 }
@@ -82,10 +95,12 @@ void StateItem::mouseDoubleClickEvent(QGraphicsSceneMouseEvent* e){
 
 // Desenha o estado; se for "final", desenha um anel interno
 void StateItem::paint(QPainter* p, const QStyleOptionGraphicsItem* o, QWidget* w){
-    // círculo base
-    QGraphicsEllipseItem::paint(p, o, w);
+    // desenho controlado (em vez do paint da base) para colorir "ativo"
+    p->setPen(pen());
+    p->setBrush(active_ ? QBrush(QColor(255,250,200)) : brush());
+    p->drawEllipse(rect());
 
-    // estado final: desenha um círculo interno
+    // estado final: círculo interno
     if (final_){
         QPen ringPen = pen();
         ringPen.setWidthF(std::max(1.0, pen().widthF() * 0.8));
@@ -95,4 +110,7 @@ void StateItem::paint(QPainter* p, const QStyleOptionGraphicsItem* o, QWidget* w
         QRectF inner = rect().adjusted(inset, inset, -inset, -inset);
         p->drawEllipse(inner);
     }
+
+    // desenhar o rótulo normalmente
+    Q_UNUSED(o); Q_UNUSED(w);
 }
