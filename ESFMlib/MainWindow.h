@@ -2,11 +2,13 @@
 #include <QMainWindow>
 
 class QGraphicsView;
-class QGraphicsScene;
+class DiagramScene; // <-- em vez de QGraphicsScene
 class QTableView;
 class VarModel;
 class InputModel;
 class OutputModel;  // <-- NOVO
+
+class StateItem;   // forward declaration
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -30,9 +32,23 @@ private slots:
     void addOutput();
     void deleteSelectedOutputs();
 
+    void stepOnce();                   // <- NOVO
+
 private:
+    bool hasInitialState() const;
+    void makeInitialIfNone(StateItem* s);
+    StateItem* findInitial() const;
+
+    // helpers do Step (NOVO)
+    bool buildJsContext(class QJSEngine& eng);               // carrega X,I,O
+    static bool jsToBool(const class QJSValue& v, bool& ok); // conversões
+    static QString qjsToString(const class QJSValue& v);
+
     QGraphicsView*  view_  = nullptr;
-    QGraphicsScene* scene_ = nullptr;
+    DiagramScene*   scene_ = nullptr; // <-- trocado
+
+    // NOVO: ponteiro do estado corrente
+    StateItem* currentState_ = nullptr;
 
     // Variáveis
     QTableView* varTable_ = nullptr;
