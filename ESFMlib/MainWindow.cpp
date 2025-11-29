@@ -18,6 +18,12 @@
 #include <QtQml/QJSEngine>
 #include <QtQml/QJSValue>
 #include <QMessageBox>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QFile>
+#include <QFileInfo>
+#include <QFileDialog>
 #include <QStatusBar>   // para statusBar()->showMessage(...)
 #include <algorithm>    // std::remove_if, std::sort
 #include <cmath>        // std::llround
@@ -26,6 +32,7 @@
 #include "InputModel.h"   // <-- NOVO
 #include "VarModel.h"
 #include "DiagramScene.h"
+#include "TransitionEditorDialog.h"   // <-- necessário para editar via toolbar
 
 
 MainWindow::MainWindow(QWidget* parent)
@@ -55,11 +62,25 @@ MainWindow::MainWindow(QWidget* parent)
                            : DiagramScene::Mode::Select);
     });
 
+    // Abrir e salvar modelo
+    auto actOpen  = tb->addAction("Abrir…");
+    auto actSave  = tb->addAction("Salvar…");
+    connect(actOpen, &QAction::triggered, this, &MainWindow::openModel);
+    connect(actSave, &QAction::triggered, this, &MainWindow::saveModel);
+
     auto actStep = tb->addAction("Step");
     actStep->setShortcut(Qt::Key_F10);
     actStep->setShortcutContext(Qt::WidgetWithChildrenShortcut);
     addAction(actStep);
     connect(actStep, &QAction::triggered, this, &MainWindow::stepOnce);
+
+    // Botão para editar transição selecionada
+    actEditTransition_ = tb->addAction("Editar Transição");
+    actEditTransition_->setEnabled(false);
+    connect(actEditTransition_, &QAction::triggered, this, &MainWindow::editSelectedTransition);
+
+    // Habilita/desabilita com base na seleção da cena
+    connect(scene_, &QGraphicsScene::selectionChanged, this, &MainWindow::updateActionsEnabled);
 
     // Novo Estado
     auto actNew = tb->addAction("Novo Estado");
@@ -207,13 +228,47 @@ MainWindow::MainWindow(QWidget* parent)
 
 void MainWindow::deleteSelected(){
     if (!scene_) return;
-    const auto items = scene_->selectedItems();
-    for (QGraphicsItem* gi : items) {
-        if (auto st = dynamic_cast<StateItem*>(gi)) {
-            scene_->removeItem(st);
-            delete st;
+
+    const auto sel = scene_->selectedItems();
+    if (sel.isEmpty()) return;
+
+    // Colete tudo que deve ser apagado para evitar invalidar iteração
+    QVector<QGraphicsItem*> toDelete;
+    toDelete.reserve(sel.size()*3);
+
+    for (QGraphicsItem* gi : sel){
+        toDelete.push_back(gi);
+        if (auto st = dynamic_cast<StateItem*>(gi)){
+            // também apaga todas as transições incidentes ao estado
+            for (QGraphicsItem* gj : scene_->items()){
+                if (auto tr = dynamic_cast<TransitionItem*>(gj)){
+                    if (tr->src()==st || tr->dst()==st) toDelete.push_back(tr);
+                }
+            }
         }
     }
+    // Remove duplicatas
+    std::sort(toDelete.begin(), toDelete.end());
+    toDelete.erase(std::unique(toDelete.begin(), toDelete.end()), toDelete.end());
+
+    // Se o estado corrente será apagado, zere o ponteiro
+    for (auto* gi : toDelete){
+        if (gi == currentState_) { currentState_ = nullptr; break; }
+    }
+
+    // Apaga
+    for (auto* gi : toDelete){
+        scene_->removeItem(gi);
+        delete gi;
+    }
+
+    // Se perdemos o estado corrente, escolha o inicial (se houver)
+    if (!currentState_){
+        currentState_ = findInitial();
+        if (currentState_) currentState_->setActive(true);
+    }
+
+    updateActionsEnabled();
 }
 
 void MainWindow::markSelectedAsInitial(){
@@ -521,5 +576,253 @@ void MainWindow::stepOnce(){
         2000
     );
 }
+
+TransitionItem* MainWindow::selectedTransition() const {
+    if (!scene_) return nullptr;
+    const auto sel = scene_->selectedItems();
+    if (sel.size()!=1) return nullptr;
+    return dynamic_cast<TransitionItem*>(sel.front());
+}
+
+void MainWindow::updateActionsEnabled(){
+    actEditTransition_->setEnabled(selectedTransition()!=nullptr);
+}
+
+void MainWindow::editSelectedTransition(){
+    TransitionItem* t = selectedTransition();
+    if (!t) return;
+    TransitionEditorDialog dlg(this);
+    dlg.setValues(t->priority(), t->guard(), t->action(), t->label());
+    if (dlg.exec()==QDialog::Accepted){
+        t->setPriority(dlg.priority());
+        t->setGuard(dlg.guard());
+        t->setAction(dlg.action());
+        t->setLabel(dlg.label());
+    }
+}
+
+QJsonValue MainWindow::encodeJsonValue(const QString& s) {
+    const QString t = s.trimmed();
+    if (t.compare("true",  Qt::CaseInsensitive)==0)  return QJsonValue(true);
+    if (t.compare("false", Qt::CaseInsensitive)==0)  return QJsonValue(false);
+    bool ok=false; qlonglong n = t.toLongLong(&ok);
+    if (ok) return QJsonValue((double)n);
+    return QJsonValue(t);
+}
+
+QString MainWindow::decodeJsonValue(const QJsonValue& v) {
+    if (v.isBool())   return v.toBool() ? "true" : "false";
+    if (v.isDouble()) return QString::number((qlonglong)std::llround(v.toDouble()));
+    return v.toString();
+}
+
+QJsonObject MainWindow::toJson() const {
+    QJsonObject root;
+
+    // --- Vars / Inputs / Outputs ---
+    auto mapToArray = [&](auto* model)->QJsonArray{
+        QJsonArray arr;
+        if (!model) return arr;
+        for (int r=0; r<model->rowCount(); ++r){
+            const QString name = model->index(r,0).data().toString();
+            const QString val  = model->index(r,1).data().toString();
+            QJsonObject o; o["name"]=name; o["value"]=encodeJsonValue(val);
+            arr.push_back(o);
+        }
+        return arr;
+    };
+    root["vars"]    = mapToArray(varModel_);
+    root["inputs"]  = mapToArray(inputModel_);
+    root["outputs"] = mapToArray(outputModel_);
+
+    // --- States ---
+    QJsonArray jstates;
+    for (QGraphicsItem* gi : scene_->items()){
+        if (auto s = dynamic_cast<StateItem*>(gi)){
+            QJsonObject o;
+            o["name"]    = s->name();
+            o["x"]       = s->pos().x();
+            o["y"]       = s->pos().y();
+            o["initial"] = s->isInitial();
+            o["final"]   = s->isFinal();
+            jstates.push_back(o);
+        }
+    }
+    root["states"] = jstates;
+
+    // --- Transitions ---
+    QJsonArray jtrans;
+    // salvar na ordem atual de criação/ID para manter aparência (paralelas/self-loops)
+    QVector<TransitionItem*> ts;
+    for (QGraphicsItem* gi : scene_->items())
+        if (auto t = dynamic_cast<TransitionItem*>(gi)) ts.push_back(t);
+    std::sort(ts.begin(), ts.end(),
+              [](TransitionItem* a, TransitionItem* b){ return a->id() < b->id(); });
+
+    for (auto* t : ts){
+        QJsonObject o;
+        o["from"]     = t->src()->name();
+        o["to"]       = t->dst()->name();
+        o["guard"]    = t->guard();
+        o["action"]   = t->action();
+        o["priority"] = t->priority();
+        o["label"]    = t->label();
+        jtrans.push_back(o);
+    }
+    root["transitions"] = jtrans;
+
+    return root;
+}
+
+void MainWindow::clearSceneAndTables(){
+    // limpa itens da cena
+    for (QGraphicsItem* gi : scene_->items()) scene_->removeItem(gi);
+    // (QGraphicsItem* são ownership da scene se parent==nullptr)
+    // mas garantimos:
+    qDeleteAll(scene_->items());
+
+    // limpa models (mantém cabeçalhos)
+    if (varModel_)    varModel_->removeRows(0, varModel_->rowCount());
+    if (inputModel_)  inputModel_->removeRows(0, inputModel_->rowCount());
+    if (outputModel_) outputModel_->removeRows(0, outputModel_->rowCount());
+
+    // estado corrente
+    if (currentState_) { currentState_->setActive(false); currentState_ = nullptr; }
+}
+
+bool MainWindow::loadFromJsonObject(const QJsonObject& root){
+    clearSceneAndTables();
+
+    // 1) Estados
+    QMap<QString, StateItem*> name2state;
+    const auto jstates = root.value("states").toArray();
+    for (const auto& v : jstates){
+        const auto o = v.toObject();
+        auto* s = new StateItem(o.value("name").toString());
+        scene_->addItem(s);
+        s->setPos(o.value("x").toDouble(), o.value("y").toDouble());
+        s->setInitial(o.value("initial").toBool());
+        s->setFinal(o.value("final").toBool());
+        name2state.insert(s->name(), s);
+    }
+
+    // 2) Transições (na ordem salva)
+    const auto jtrans = root.value("transitions").toArray();
+    for (const auto& v : jtrans){
+        const auto o = v.toObject();
+        auto* src = name2state.value(o.value("from").toString(), nullptr);
+        auto* dst = name2state.value(o.value("to").toString(),   nullptr);
+        if (!src || !dst) continue;
+        auto* t = new TransitionItem(src, dst);
+        scene_->addItem(t);
+        t->setPriority(o.value("priority").toInt(1));
+        t->setGuard(o.value("guard").toString("true"));
+        t->setAction(o.value("action").toString());
+        t->setLabel(o.value("label").toString());
+        t->updatePath();
+    }
+
+    // 3) Vars / Inputs / Outputs
+    auto loadArrayToModel = [&](const char* key, auto* model){
+        if (!model) return;
+        const auto arr = root.value(key).toArray();
+        for (const auto& v : arr){
+            const auto o = v.toObject();
+            const QString name = o.value("name").toString();
+            const QString sval = decodeJsonValue(o.value("value"));
+            model->addXXX(name, QVariant()); // veremos logo abaixo a “ponte”
+            const int row = model->rowCount()-1;
+            model->setData(model->index(row,1), sval, Qt::EditRole);
+        }
+    };
+
+    // Como cada model tem um método com nome diferente, chamamos diretamente:
+    // Vars
+    if (varModel_){
+        const auto arr = root.value("vars").toArray();
+        for (const auto& v : arr){
+            const auto o = v.toObject();
+            const QString name = o.value("name").toString();
+            const QString sval = decodeJsonValue(o.value("value"));
+            varModel_->addVar(name, QVariant());
+            const int row = varModel_->rowCount()-1;
+            varModel_->setData(varModel_->index(row,1), sval, Qt::EditRole);
+        }
+    }
+    // Inputs
+    if (inputModel_){
+        const auto arr = root.value("inputs").toArray();
+        for (const auto& v : arr){
+            const auto o = v.toObject();
+            const QString name = o.value("name").toString();
+            const QString sval = decodeJsonValue(o.value("value"));
+            inputModel_->addInput(name, QVariant());
+            const int row = inputModel_->rowCount()-1;
+            inputModel_->setData(inputModel_->index(row,1), sval, Qt::EditRole);
+        }
+    }
+    // Outputs
+    if (outputModel_){
+        const auto arr = root.value("outputs").toArray();
+        for (const auto& v : arr){
+            const auto o = v.toObject();
+            const QString name = o.value("name").toString();
+            const QString sval = decodeJsonValue(o.value("value"));
+            outputModel_->addOutput(name, QVariant());
+            const int row = outputModel_->rowCount()-1;
+            outputModel_->setData(outputModel_->index(row,1), sval, Qt::EditRole);
+        }
+    }
+
+    // 4) estado inicial/corrente
+    currentState_ = nullptr;
+    for (auto* s : name2state)
+        if (s->isInitial()) { currentState_ = s; break; }
+    if (currentState_) currentState_->setActive(true);
+
+    return true;
+}
+
+void MainWindow::saveModel(){
+    QFileDialog dlg(this, "Salvar modelo");
+    dlg.setAcceptMode(QFileDialog::AcceptSave);
+    dlg.setNameFilters({ "EFSM JSON (*.json)" });
+    dlg.setDefaultSuffix("json");                  // <- anexa .json se faltar
+    if (!dlg.exec()) return;
+
+    const QString path = dlg.selectedFiles().value(0);
+    QJsonDocument doc(toJson());
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly)) {
+        QMessageBox::warning(this, "Erro", "Não foi possível abrir o arquivo para escrita.");
+        return;
+    }
+    f.write(doc.toJson(QJsonDocument::Indented));
+    f.close();
+    statusBar()->showMessage("Modelo salvo em: " + path, 3000);
+}
+
+void MainWindow::openModel(){
+    const QString path = QFileDialog::getOpenFileName(this, "Abrir modelo", {}, "EFSM JSON (*.json)");
+    if (path.isEmpty()) return;
+
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this, "Erro", "Não foi possível abrir o arquivo.");
+        return;
+    }
+    const auto doc = QJsonDocument::fromJson(f.readAll());
+    f.close();
+    if (!doc.isObject()){
+        QMessageBox::warning(this, "Erro", "Formato JSON inválido.");
+        return;
+    }
+    if (loadFromJsonObject(doc.object()))
+        statusBar()->showMessage("Modelo carregado de: " + path, 3000);
+}
+
+
+
+
 
 
