@@ -275,8 +275,7 @@ target_link_libraries(EFSMStudio PRIVATE
 
 ---
 
-## 14) License & Credits
+## 14) Credits
 
-* **License:** TBD (MIT/BSD/GPL, etc.)
 * **Authors:** Eduardo Silveira Godinho & Sergio Bonini
 * **Tech:** Qt, CMake
